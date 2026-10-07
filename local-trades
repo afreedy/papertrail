@@ -1,0 +1,133 @@
+#!/usr/bin/env python3
+"""Build a local congressional disclosure library directly from official sources."""
+import argparse
+from datetime import date, datetime, timezone
+import hashlib
+import json
+from pathlib import Path
+import sqlite3
+import sys
+import tempfile
+from types import SimpleNamespace
+import cli
+
+DEFAULT_DB = cli.PROFILE_ROOT / 'disclosures.sqlite3'
+
+
+def connect(path):
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    db = sqlite3.connect(path)
+    db.executescript('''
+      CREATE TABLE IF NOT EXISTS documents(sha TEXT PRIMARY KEY, body BLOB NOT NULL);
+      CREATE TABLE IF NOT EXISTS filings(
+        source TEXT, url TEXT, sha TEXT, status TEXT, metadata TEXT, error TEXT, fetched_at TEXT,
+        PRIMARY KEY(source,url));
+      CREATE TABLE IF NOT EXISTS trades(
+        source TEXT, url TEXT, ordinal INTEGER, data TEXT, PRIMARY KEY(source,url,ordinal));
+    ''')
+    return db
+
+
+def store(db, source, filing, body, records, error=None, amendment=False):
+    sha = hashlib.sha256(body).hexdigest() if body is not None else None
+    status = 'review' if error else ('amendment_review' if amendment else 'parsed')
+    url = filing['source_url']
+    with db:
+        if body is not None: db.execute('INSERT OR IGNORE INTO documents VALUES(?,?)',(sha,body))
+        db.execute('INSERT OR REPLACE INTO filings VALUES(?,?,?,?,?,?,?)',
+            (source,url,sha,status,json.dumps(filing),error,datetime.now(timezone.utc).isoformat()))
+        db.execute('DELETE FROM trades WHERE source=? AND url=?',(source,url))
+        for ordinal, row in enumerate(records):
+            db.execute('INSERT INTO trades VALUES(?,?,?,?)',(source,url,ordinal,json.dumps(row)))
+    return status
+
+
+def sync(db,args):
+    opts = SimpleNamespace(command='list',name=args.name,first_name='',type='P' if args.source=='house' else 'ptr',
+        year=args.year,limit=args.limit,offset=args.offset,input=None,url=None,filer='all',state='',
+        since='',until='',acknowledge_use_restrictions=args.acknowledge_use_restrictions)
+    records,total,url,coverage,paginated = getattr(cli,args.source)(opts)
+    filings = records if paginated else records[args.offset:args.offset+args.limit]
+    results=[]
+    for filing in filings:
+        body=None; rows=[]; error=None; amendment=False
+        try:
+            if args.source=='house':
+                body=cli.fetch('house',filing['source_url'])
+                if not body.startswith(b'%PDF-'): raise cli.SourceError('Expected official House PDF.')
+                with tempfile.NamedTemporaryFile(suffix='.pdf') as f:
+                    f.write(body); f.flush()
+                    rows=cli.house_pdf(Path(f.name),filing['source_url'])
+                    text=cli.subprocess.check_output(['pdftotext',str(f.name),'-'],text=True)
+                    amendment='amend' in text.casefold()
+            else:
+                opts.command='trades'; opts.url=filing['source_url']; opts.ticker=''
+                text,_=cli.senate_page(opts); body=text.encode()
+                with tempfile.NamedTemporaryFile(mode='w',suffix='.html') as f:
+                    f.write(text); f.flush(); opts.input=f.name
+                    rows=cli.senate(opts)[0]
+                amendment='amend' in filing['document_type'].casefold() or any(
+                    'amend' in h.casefold() for h in cli.HTML(text).headings)
+            if not rows: raise cli.SourceError('No supported transactions; review original filing.')
+        except (cli.SourceError,OSError,ValueError,KeyError,TypeError,cli.subprocess.SubprocessError) as e:
+            error=str(e); rows=[]
+        finally: opts.input=None
+        status=store(db,args.source,filing,body,rows,error,amendment)
+        item=dict(source=args.source,url=filing['source_url'],status=status,trades=len(rows),error=error)
+        results.append(item)
+        print(json.dumps(item),file=sys.stderr)
+    print(json.dumps(dict(database=str(args.db),source=args.source,matched_filings=total,
+        offset=args.offset,processed=len(results),remaining=max(0,total-args.offset-len(results)),results=results),indent=2))
+    return 1 if any(r['status']=='review' for r in results) else 0
+
+
+def main():
+    p=argparse.ArgumentParser(description=__doc__)
+    p.add_argument('--db',type=Path,default=DEFAULT_DB)
+    subs=p.add_subparsers(dest='command',required=True)
+    s=subs.add_parser('sync',help='Fetch a bounded page of official PTRs; rerunning replaces rows, never duplicates them')
+    s.add_argument('--source',choices=('house','senate'),required=True)
+    s.add_argument('--name',default=''); s.add_argument('--year',type=int,default=date.today().year)
+    s.add_argument('--limit',type=cli.positive,default=25); s.add_argument('--offset',type=cli.nonnegative,default=0)
+    s.add_argument('--acknowledge-use-restrictions',action='store_true')
+    for kind in ('filings','trades'):
+        s=subs.add_parser(kind,help='Query the local database without contacting any site')
+        s.add_argument('--source',choices=('house','senate')); s.add_argument('--name',default='')
+        s.add_argument('--ticker',default=''); s.add_argument('--review',action='store_true',help='Include review/amendment records')
+        s.add_argument('--limit',type=cli.positive,default=25); s.add_argument('--offset',type=cli.nonnegative,default=0)
+        s.add_argument('--format',choices=('json','csv'),default='json')
+    s=subs.add_parser('document',help='Export an archived original, without overwriting')
+    key=s.add_mutually_exclusive_group(required=True); key.add_argument('--url'); key.add_argument('--sha')
+    s.add_argument('--output',required=True,type=Path)
+    args=p.parse_args(); args.db=args.db.expanduser().resolve()
+    try:
+        with connect(args.db) as db:
+            if args.command=='sync': return sync(db,args)
+            if args.command=='document':
+                row=db.execute('SELECT body,sha FROM documents WHERE sha=?',(args.sha,)).fetchone() if args.sha else db.execute(
+                    'SELECT d.body,d.sha FROM documents d JOIN filings f ON f.sha=d.sha WHERE f.url=?',(args.url,)).fetchone()
+                if row is None: raise cli.SourceError('Original is not available locally.')
+                with args.output.open('xb') as f: f.write(row[0])
+                print(json.dumps(dict(output=str(args.output.resolve()),sha=row[1]))); return 0
+            records=[]
+            for source,url,status,metadata,error,stamp,sha in db.execute('SELECT source,url,status,metadata,error,fetched_at,sha FROM filings ORDER BY fetched_at DESC'):
+                if args.source and source!=args.source: continue
+                if args.command=='trades' and status!='parsed' and not args.review: continue
+                filing=json.loads(metadata)
+                if not cli.matches(args.name,filing['name']): continue
+                if args.command=='filings':
+                    records.append(dict(**filing,source=source,status=status,error=error,fetched_at=stamp,sha=sha))
+                else:
+                    for (data,) in db.execute('SELECT data FROM trades WHERE source=? AND url=? ORDER BY ordinal',(source,url)):
+                        trade=json.loads(data)
+                        if args.ticker and (trade.get('ticker') or '').casefold()!=args.ticker.casefold(): continue
+                        records.append(dict(**trade,source=source,review_status=status,document_sha=sha))
+            records.sort(key=lambda r:(r.get('filed_date') or '',r.get('trade_date') or ''),reverse=True)
+            args.input=str(args.db)
+            cli.emit('local',args,(records,len(records),None,'Locally stored official filings only; amount ranges preserved. Separate/amended filings are not inferred to be distinct economic trades.',False))
+    except (cli.SourceError,OSError,ValueError,sqlite3.Error,cli.subprocess.SubprocessError) as e:
+        print(json.dumps(dict(status='error',error=str(e))),file=sys.stderr); return 1
+    return 0
+
+
+if __name__=='__main__': raise SystemExit(main())

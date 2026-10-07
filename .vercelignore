@@ -1,0 +1,10 @@
+.playwright-cli
+__pycache__
+.env*
+local-trades
+*.sqlite3*
+
+output
+
+tmp/
+output/

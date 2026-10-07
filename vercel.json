@@ -1,0 +1,33 @@
+{
+  "buildCommand": "npm run build",
+  "outputDirectory": "dist",
+  "functions": {
+    "api/search.py": {
+      "maxDuration": 120
+    },
+    "api/account.js": {
+      "maxDuration": 300
+    }
+  },
+  "crons": [
+    {
+      "path": "/api/account?action=cron",
+      "schedule": "0 1 * * *"
+    }
+  ],
+  "headers": [
+    {
+      "source": "/(.*)",
+      "headers": [
+        {
+          "key": "X-Content-Type-Options",
+          "value": "nosniff"
+        },
+        {
+          "key": "Referrer-Policy",
+          "value": "strict-origin-when-cross-origin"
+        }
+      ]
+    }
+  ]
+}
