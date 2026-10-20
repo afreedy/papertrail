@@ -1,5 +1,7 @@
 # Papertrail
 
+**Live website:** [public-ledger-seven.vercel.app](https://public-ledger-seven.vercel.app). Email alerts require the owner's sign-in; public disclosure search remains separate from private watchlists.
+
 A personal politician disclosure dashboard. Search a politician, inspect trades or annual reported holdings, and follow them for email alerts. Trade execution stays manual.
 
 ## Search and alerts
